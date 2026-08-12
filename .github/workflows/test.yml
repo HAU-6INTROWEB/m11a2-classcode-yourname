@@ -1,0 +1,192 @@
+name: Autograde
+
+# Runs the test suite on every push so graders see a pass/fail at a glance, and
+# renders a screenshot of every HTML page. Screenshots are published to a separate
+# "previews" branch (a timestamped folder per run, one image per page + a README
+# that embeds them) and linked from the run summary. Your own working branch is
+# never touched, so there is nothing to git pull. Works on private repos; no Pages.
+on:
+  push:
+    branches-ignore: [previews]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # lets the preview step push to the previews branch
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        id: tests
+        run: npx vitest run --reporter=default --reporter=json --outputFile=test-results.json
+
+      # ---- Page preview (never affects the grade) -------------------------
+      # Don't spend CI minutes spinning up a browser until there is something to
+      # render. The starter file is just an HTML comment, so a page counts as
+      # renderable only once something remains after stripping comments + whitespace.
+      - name: Check for renderable content
+        if: always()
+        run: |
+          node <<'EOF' >> "$GITHUB_ENV"
+          const { readdirSync, readFileSync, existsSync } = require('node:fs')
+          const root = existsSync('src') ? 'src' : '.'
+          const skip = new Set(['node_modules', 'test', 'tests', 'submission', 'previews'])
+          function listHtml(dir, rel = '') {
+            const out = []
+            for (const e of readdirSync(dir, { withFileTypes: true })) {
+              if (e.name.startsWith('.') || skip.has(e.name)) continue
+              const r = rel ? `${rel}/${e.name}` : e.name
+              if (e.isDirectory()) out.push(...listHtml(`${dir}/${e.name}`, r))
+              else if (e.name.toLowerCase().endsWith('.html')) out.push(r)
+            }
+            return out
+          }
+          const hasContent = listHtml(root).some((rel) =>
+            readFileSync(`${root}/${rel}`, 'utf8')
+              .replace(/<!--[\s\S]*?-->/g, '').replace(/\s+/g, '').length > 0)
+          console.log(`HAS_CONTENT=${hasContent ? '1' : '0'}`)
+          EOF
+
+      - name: Cache the preview browser
+        if: ${{ always() && env.HAS_CONTENT == '1' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-chromium-${{ runner.os }}
+
+      - name: Install browser for preview
+        if: ${{ always() && env.HAS_CONTENT == '1' }}
+        continue-on-error: true
+        run: |
+          npm i -D playwright >/dev/null 2>&1
+          npx playwright install chromium
+
+      - name: Render page preview
+        if: ${{ always() && env.HAS_CONTENT == '1' }}
+        continue-on-error: true
+        run: |
+          TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+          echo "TS=$TS" >> "$GITHUB_ENV"
+          cat > shot.mjs <<'EOF'
+          import { chromium } from 'playwright'
+          import { pathToFileURL } from 'node:url'
+          import { readdirSync, mkdirSync, writeFileSync, existsSync } from 'node:fs'
+
+          const ts = process.argv[2] || 'preview'
+          const outDir = `submission/${ts}`
+          mkdirSync(outDir, { recursive: true })
+
+          // Students build their site in src/; fall back to repo root if absent.
+          const root = existsSync('src') ? 'src' : '.'
+          const skip = new Set(['node_modules', 'test', 'tests', 'submission', 'previews'])
+          function listHtml(dir, rel = '') {
+            const out = []
+            for (const e of readdirSync(dir, { withFileTypes: true })) {
+              if (e.name.startsWith('.') || skip.has(e.name)) continue
+              const r = rel ? `${rel}/${e.name}` : e.name
+              if (e.isDirectory()) out.push(...listHtml(`${dir}/${e.name}`, r))
+              else if (e.name.toLowerCase().endsWith('.html')) out.push(r)
+            }
+            return out
+          }
+          const pages = listHtml(root).sort((a, b) =>
+            (a === 'index.html' ? '' : a).localeCompare(b === 'index.html' ? '' : b))
+
+          const browser = await chromium.launch()
+          const done = []
+          try {
+            for (const rel of pages) {
+              const img = (rel.replace(/\.html$/i, '').replace(/[\/\\]/g, '-') || 'index') + '.png'
+              try {
+                const page = await browser.newPage({ viewport: { width: 1024, height: 800 } })
+                await page.goto(pathToFileURL(`${root}/${rel}`).href, { waitUntil: 'load', timeout: 15000 }).catch(() => {})
+                await page.screenshot({ path: `${outDir}/${img}`, fullPage: true })
+                await page.close()
+                done.push({ rel, img })
+              } catch {}
+            }
+          } finally {
+            await browser.close()
+          }
+          const md = [
+            `# Submission preview - ${ts}`, '',
+            'Rendered screenshot(s) of your page(s) at this submission (UTC).', '',
+            ...done.flatMap((p) => [`## ${p.rel}`, '', `![${p.rel}](./${p.img})`, '']),
+          ].join('\n')
+          writeFileSync(`${outDir}/README.md`, md)
+          console.log(`pages: ${done.length}`)
+          EOF
+          node shot.mjs "$TS"
+
+      # Publish the screenshots to a dedicated "previews" branch using a separate
+      # worktree, so the student's working branch is never modified (nothing to pull).
+      - name: Publish preview to previews branch
+        if: ${{ always() && env.HAS_CONTENT == '1' }}
+        continue-on-error: true
+        run: |
+          [ -n "$TS" ] && [ -d "submission/$TS" ] || exit 0
+          git config user.name "course-bot"
+          git config user.email "course-bot@users.noreply.github.com"
+
+          WT="$RUNNER_TEMP/previews"
+          git fetch origin previews 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/previews; then
+            git worktree add "$WT" -B previews origin/previews
+          else
+            git worktree add --detach "$WT" HEAD
+            git -C "$WT" checkout --orphan previews
+            git -C "$WT" rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          mkdir -p "$WT/submission"
+          cp -r "submission/$TS" "$WT/submission/$TS"
+
+          git -C "$WT" add submission
+          git -C "$WT" diff --cached --quiet && { echo "no preview change"; exit 0; }
+          git -C "$WT" commit -m "📸 Page preview $TS [skip ci]"
+          git -C "$WT" push origin previews
+
+      - name: Write grading summary
+        if: always()
+        run: |
+          node <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          const fs = require('fs');
+          let r;
+          try { r = JSON.parse(fs.readFileSync('test-results.json', 'utf8')); }
+          catch { console.log('## ❌ Tests did not run (build/install error)'); process.exit(0); }
+
+          const tests = r.testResults.flatMap(f => f.assertionResults);
+          const passed = tests.filter(t => t.status === 'passed').length;
+          const total = tests.length;
+
+          console.log(`## ${passed === total ? '✅' : '❌'} ${passed} / ${total} tests passed`);
+          console.log('');
+          console.log('| Result | Test |');
+          console.log('| --- | --- |');
+          for (const t of tests) {
+            const icon = t.status === 'passed' ? '✅' : '❌';
+            console.log(`| ${icon} | ${t.fullName || t.title} |`);
+          }
+          const ts = process.env.TS;
+          if (ts) {
+            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/blob/previews/submission/${ts}/README.md`;
+            console.log('');
+            console.log(`📸 **Page preview:** [view rendered page(s) (${ts})](${url})`);
+          }
+          EOF
